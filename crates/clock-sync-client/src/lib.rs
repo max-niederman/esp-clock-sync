@@ -146,18 +146,9 @@ static SAMPLES_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// `mac_tsf_us()` and `synced_ns_at_tsf` directly.
 static INSTANT_MINUS_TSF: AtomicI64 = AtomicI64::new(DELTA_UNSET);
 
-/// EMA of (ap_tsf_us - instant_us_at_cb + cb_latency_ema) over beacons from
-/// our locked AP. The cb_latency_ema correction subtracts each board's mean
-/// software callback latency so the anchor refers to the *physical RX time*
-/// (where both boards see the same beacon), eliminating the per-board
-/// systematic offset (~tens of µs) caused by differing WiFi-driver
-/// scheduling.
+/// EMA of (ap_tsf_us - instant_us_at_cb) over beacons from our locked AP.
+/// Used by `instant_to_ap_tsf` for the precision-sync conversion.
 static AP_TSF_MINUS_INSTANT_EMA: AtomicI64 = AtomicI64::new(DELTA_UNSET);
-
-/// EMA of beacon callback latency (mac_tsf_us at cb - rx_cntl.timestamp,
-/// in µs). The mean is per-board; subtracting it from the
-/// `AP_TSF_MINUS_INSTANT_EMA` update removes the systematic bias.
-static CB_LATENCY_EMA: AtomicI64 = AtomicI64::new(0);
 
 /// Public handle returned by [`install`]. Cheap to copy (`&'static`).
 pub struct ClockSyncClient {
@@ -368,6 +359,9 @@ fn rx_cb(packet: PromiscuousPkt<'_>) {
                 *LATEST_BEACON.borrow_ref_mut(cs) = Some(anchor);
             });
 
+            // EMA-smooth the (ap_tsf - instant_at_cb) offset. 1/16 EMA
+            // gives ~1.6 s time constant at 10 Hz beacons, balancing
+            // per-beacon noise filtering against drift tracking lag.
             let new_delta = (ap_tsf_us as i64).wrapping_sub(instant_us_at_cb as i64);
             let prev = AP_TSF_MINUS_INSTANT_EMA.load(Ordering::Relaxed);
             let updated = if prev == DELTA_UNSET {
@@ -375,8 +369,9 @@ fn rx_cb(packet: PromiscuousPkt<'_>) {
             } else {
                 let diff = new_delta - prev;
                 if diff.unsigned_abs() < 2_000 {
-                    prev + diff / 16 // ~1.6 s at 10 Hz beacons
+                    prev + diff / 16
                 } else {
+                    // Outlier guard.
                     prev + diff / 256
                 }
             };
@@ -418,33 +413,20 @@ fn own_tsf_to_ap_tsf(own_tsf_us: u64) -> Option<u64> {
     if ap < 0 { None } else { Some(ap as u64) }
 }
 
-/// Instant µs → AP_TSF µs using the EMA-smoothed (ap_tsf - instant) offset.
-/// Smoothing filters per-beacon callback-latency jitter; the residual error
-/// is EMA tracking lag (~µs/sec for crystal drift over the EMA time
-/// constant).
+/// Instant µs → AP_TSF µs via EMA-smoothed offset.
 fn instant_to_ap_tsf(instant_us: u64) -> Option<u64> {
     let delta = AP_TSF_MINUS_INSTANT_EMA.load(Ordering::Relaxed);
-    if delta == DELTA_UNSET {
-        return None;
-    }
+    if delta == DELTA_UNSET { return None; }
     let ap = (instant_us as i128) + (delta as i128);
-    if ap < 0 || ap > u64::MAX as i128 {
-        return None;
-    }
-    Some(ap as u64)
+    if ap < 0 || ap > u64::MAX as i128 { None } else { Some(ap as u64) }
 }
 
 /// Inverse.
 fn ap_tsf_to_instant(ap_tsf_us: u64) -> Option<u64> {
     let delta = AP_TSF_MINUS_INSTANT_EMA.load(Ordering::Relaxed);
-    if delta == DELTA_UNSET {
-        return None;
-    }
+    if delta == DELTA_UNSET { return None; }
     let inst = (ap_tsf_us as i128) - (delta as i128);
-    if inst < 0 || inst > u64::MAX as i128 {
-        return None;
-    }
-    Some(inst as u64)
+    if inst < 0 || inst > u64::MAX as i128 { None } else { Some(inst as u64) }
 }
 
 fn instant_us_to_tsf_us(instant_us: u64) -> Option<u64> {

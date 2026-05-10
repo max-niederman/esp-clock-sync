@@ -318,6 +318,207 @@ impl Estimator {
     }
 }
 
+/// Sliding-window linear regression of `y` against `x`, both `i64` (typically
+/// in microseconds). Tracks **both** intercept *and* slope, so once enough
+/// samples have accumulated, the slope absorbs slow drift between the two
+/// clocks and per-sample callback jitter no longer leaks into the prediction.
+///
+/// Predictions are `O(1)`; updates are `O(N)`.
+///
+/// Use this for the Instant↔AP_TSF mapping in clock-sync-client: with a long
+/// window, the slope (≈ relative crystal drift, ~10s of ppm) becomes well
+/// determined, leaving short-term predictions limited only by `σ_y / sqrt(N)`
+/// rather than `σ_y` per sample.
+pub struct LinearTracker {
+    samples: [Option<(i64, i64)>; 256],
+    head: usize,
+    n: u16,
+    /// Most-recently-inserted sample x. Tracked so predictions can know
+    /// "how far past the window are we extrapolating".
+    last_x: i64,
+    /// Window mean of x (the anchor for the fitted line — not the latest
+    /// sample, so per-sample noise on the latest sample doesn't bias
+    /// predictions).
+    mean_x: i64,
+    /// Window mean of y, the y-coordinate of the line's anchor point.
+    mean_y: i64,
+    /// Fitted slope `dy/dx` scaled by 2^32 to preserve sub-ppm precision in
+    /// integer arithmetic.
+    slope_q32: i64,
+}
+
+impl Default for LinearTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LinearTracker {
+    pub const N: usize = 256;
+    /// Predictions return `Some` once at least this many samples have been
+    /// observed.
+    pub const MIN_SAMPLES: usize = 8;
+
+    pub const fn new() -> Self {
+        Self {
+            samples: [None; Self::N],
+            head: 0,
+            n: 0,
+            last_x: 0,
+            mean_x: 0,
+            mean_y: 0,
+            slope_q32: 0, // 0 by default — y is constant
+        }
+    }
+
+    pub fn n_samples(&self) -> u16 {
+        self.n
+    }
+
+    /// Slope in parts per billion (signed).
+    pub fn slope_ppb(&self) -> i64 {
+        ((self.slope_q32 as i128 * 1_000_000_000) >> 32) as i64
+    }
+
+    pub fn observe(&mut self, x: i64, y: i64) {
+        self.samples[self.head] = Some((x, y));
+        self.head = (self.head + 1) % Self::N;
+        if (self.n as usize) < Self::N {
+            self.n += 1;
+        }
+        self.last_x = x;
+        self.refit();
+    }
+
+    /// Predict `y` at the given `x`. Returns `None` until at least
+    /// `MIN_SAMPLES` observations have been made.
+    pub fn predict(&self, x: i64) -> Option<i64> {
+        if (self.n as usize) < Self::MIN_SAMPLES {
+            return None;
+        }
+        let dx = (x as i128) - (self.mean_x as i128);
+        let slope_part = (dx * (self.slope_q32 as i128)) >> 32;
+        let y = (self.mean_y as i128) + slope_part;
+        if y < i64::MIN as i128 || y > i64::MAX as i128 {
+            None
+        } else {
+            Some(y as i64)
+        }
+    }
+
+    /// Inverse of [`Self::predict`].
+    pub fn predict_inverse(&self, y: i64) -> Option<i64> {
+        if (self.n as usize) < Self::MIN_SAMPLES {
+            return None;
+        }
+        if self.slope_q32 == 0 {
+            // Flat fit — no unique inverse. Return the mean x.
+            return Some(self.mean_x);
+        }
+        let dy = (y as i128) - (self.mean_y as i128);
+        // dx = dy / slope. Multiply by 2^32 then divide by slope_q32.
+        let dx = (dy << 32) / (self.slope_q32 as i128);
+        let x = (self.mean_x as i128) + dx;
+        if x < i64::MIN as i128 || x > i64::MAX as i128 {
+            None
+        } else {
+            Some(x as i64)
+        }
+    }
+
+    fn refit(&mut self) {
+        // Anchor at the most recent x for numerical conditioning, then
+        // recompute mean_x / mean_y in absolute coordinates so predictions
+        // pass through the centroid of the window.
+        let anchor_x = self.last_x as i128;
+        let mut sum_dx: i128 = 0;
+        let mut sum_y: i128 = 0;
+        let mut k: i128 = 0;
+        for s in self.samples.iter().flatten() {
+            sum_dx += (s.0 as i128) - anchor_x;
+            sum_y += s.1 as i128;
+            k += 1;
+        }
+        if k < Self::MIN_SAMPLES as i128 {
+            return;
+        }
+        let mean_dx = sum_dx / k;
+        let mean_y = sum_y / k;
+
+        let mut num: i128 = 0;
+        let mut den: i128 = 0;
+        for s in self.samples.iter().flatten() {
+            let dx = ((s.0 as i128) - anchor_x) - mean_dx;
+            let dy = (s.1 as i128) - mean_y;
+            num += dx * dy;
+            den += dx * dx;
+        }
+        if den == 0 {
+            return;
+        }
+        // Clamp slope to ±0.5 (way more than any realistic rate): protects
+        // against numerical pathologies on degenerate data.
+        let raw_q32 = (num << 32) / den;
+        let max_q32 = 1i128 << 31;
+        let clamped = raw_q32.clamp(-max_q32, max_q32);
+        self.slope_q32 = clamped as i64;
+        self.mean_x = (anchor_x + mean_dx) as i64;
+        self.mean_y = mean_y as i64;
+    }
+}
+
+#[cfg(test)]
+mod tracker_tests {
+    use super::*;
+
+    #[test]
+    fn linear_tracker_recovers_constant_offset() {
+        let mut t = LinearTracker::new();
+        for i in 0..32 {
+            t.observe(i * 100, 5_000); // x in µs, y = 5 ms constant
+        }
+        let p = t.predict(3_200).unwrap();
+        assert!((p - 5_000).abs() < 10, "p={}", p);
+    }
+
+    #[test]
+    fn linear_tracker_recovers_linear_drift() {
+        // Simulate y = 5_000 + 10 ppm × x (x in µs → 10e-6 × x)
+        let mut t = LinearTracker::new();
+        for i in 0..256i64 {
+            let x = i * 100_000; // 100 ms steps in µs
+            let y = 5_000 + (10 * x) / 1_000_000; // 10 ppm
+            t.observe(x, y);
+        }
+        let last_x = 255 * 100_000;
+        let p = t.predict(last_x + 100_000).unwrap();
+        let expected = 5_000 + (10 * (last_x + 100_000)) / 1_000_000;
+        assert!(
+            (p - expected).abs() < 5,
+            "p={} expected={}",
+            p,
+            expected
+        );
+    }
+
+    #[test]
+    fn linear_tracker_filters_per_sample_noise() {
+        // y = 0 + 0 ppm × x + 200 µs noise
+        let mut t = LinearTracker::new();
+        let noise: [i64; 16] = [
+            120, -180, 90, -200, 30, 150, -80, 110, -50, 200, -100, 60, -150, 90, -30, 80,
+        ];
+        // Need 256 samples to fill window
+        for i in 0..256i64 {
+            let x = i * 100_000;
+            let y = noise[(i as usize) & 15];
+            t.observe(x, y);
+        }
+        let p = t.predict(255 * 100_000).unwrap();
+        assert!(p.abs() < 50, "p={}", p);
+    }
+}
+
 /// Integer square root for u128 (Newton iteration). Used for residual stddev.
 fn isqrt_u128(n: u128) -> u128 {
     if n < 2 {
