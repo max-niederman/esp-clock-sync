@@ -467,6 +467,168 @@ impl LinearTracker {
     }
 }
 
+/// Two-state α-β filter for tracking a slowly-drifting offset.
+///
+/// State: `(offset, rate)` where offset is in µs and rate is in PPB
+/// (offset_µs per second of x). At each observation `(x, observed_offset)`:
+///
+/// 1. Predict: `offset_predicted = offset + rate * (x - last_x) * 1e-9`
+/// 2. Innovation: `y = observed_offset - offset_predicted`
+/// 3. Update offset: `offset = offset_predicted + y / α`
+/// 4. Update rate:   `rate = rate + (y / dx_seconds) / β`
+///
+/// `α` filters per-sample noise on the offset (small α = fast tracking,
+/// big α = heavy smoothing). `β` filters slope estimation noise (big β =
+/// stable rate at the cost of slower learning). Choosing α≈16 and β≈512
+/// gives a fast-tracking offset with a rate that converges over ~1 minute
+/// of beacons.
+///
+/// All-integer; safe for `no_std`.
+#[derive(Debug)]
+pub struct AlphaBetaFilter {
+    initialized: bool,
+    /// Most recent x (in µs).
+    last_x_us: i64,
+    /// Tracked offset at `last_x_us`, scaled by `Q_OFFSET` for sub-µs precision.
+    offset_q: i128,
+    /// Tracked rate in (offset_µs * Q_RATE) per (x_µs).
+    /// Equivalently: rate_ppm = rate_q / Q_RATE * 1e6 (since slope is dimensionless).
+    rate_q: i128,
+    /// Filter gains (α, β). Use higher values for more smoothing.
+    alpha: u32,
+    beta: u32,
+}
+
+impl AlphaBetaFilter {
+    /// Q-format scale factors. offset_q = offset_us * 2^20; rate_q =
+    /// rate_dimensionless * 2^32. So `(rate_q * dx_us) >> 12` lifts a rate
+    /// into offset_q.
+    const OFFSET_Q_SHIFT: u32 = 20;
+    const RATE_Q_SHIFT: u32 = 32;
+    const RATE_TO_OFFSET_SHIFT: u32 = Self::RATE_Q_SHIFT - Self::OFFSET_Q_SHIFT; // = 12
+
+    pub const fn new(alpha: u32, beta: u32) -> Self {
+        Self {
+            initialized: false,
+            last_x_us: 0,
+            offset_q: 0,
+            rate_q: 0,
+            alpha,
+            beta,
+        }
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Tracked rate as parts-per-billion (signed).
+    pub fn rate_ppb(&self) -> i64 {
+        ((self.rate_q * 1_000_000_000) >> Self::RATE_Q_SHIFT) as i64
+    }
+
+    /// Tracked offset in µs at `last_x_us`.
+    pub fn offset_us(&self) -> i64 {
+        (self.offset_q >> Self::OFFSET_Q_SHIFT) as i64
+    }
+
+    pub fn observe(&mut self, x_us: i64, observed_offset_us: i64) {
+        if !self.initialized {
+            self.last_x_us = x_us;
+            self.offset_q = (observed_offset_us as i128) << Self::OFFSET_Q_SHIFT;
+            self.rate_q = 0;
+            self.initialized = true;
+            return;
+        }
+        let dx_us = (x_us as i128) - (self.last_x_us as i128);
+        if dx_us <= 0 {
+            // Out-of-order or duplicate; skip.
+            return;
+        }
+        // predicted_offset_q = offset_q + (rate_q * dx_us) >> (RATE - OFFSET)
+        let predicted_offset_q = self
+            .offset_q
+            .saturating_add((self.rate_q.saturating_mul(dx_us)) >> Self::RATE_TO_OFFSET_SHIFT);
+        let observed_q = (observed_offset_us as i128) << Self::OFFSET_Q_SHIFT;
+        let innovation_q = observed_q - predicted_offset_q;
+
+        // offset += innovation / α
+        self.offset_q = predicted_offset_q + innovation_q / (self.alpha as i128);
+        // observed_rate_q = (innovation_q << RATE_TO_OFFSET) / dx_us
+        // (so that observed_rate_q * dx_us >> RATE_TO_OFFSET ≈ innovation_q)
+        // rate += observed_rate / β
+        let observed_rate_q = (innovation_q << Self::RATE_TO_OFFSET_SHIFT) / dx_us;
+        self.rate_q = self.rate_q.saturating_add(observed_rate_q / (self.beta as i128));
+
+        self.last_x_us = x_us;
+    }
+
+    /// Predict offset at the given x. Returns `None` if the filter hasn't
+    /// been seeded yet.
+    pub fn predict(&self, x_us: i64) -> Option<i64> {
+        if !self.initialized {
+            return None;
+        }
+        let dx_us = (x_us as i128) - (self.last_x_us as i128);
+        let predicted_q = self
+            .offset_q
+            .saturating_add((self.rate_q.saturating_mul(dx_us)) >> Self::RATE_TO_OFFSET_SHIFT);
+        Some((predicted_q >> Self::OFFSET_Q_SHIFT) as i64)
+    }
+}
+
+#[cfg(test)]
+mod alpha_beta_tests {
+    use super::*;
+
+    #[test]
+    fn ab_recovers_constant_offset() {
+        let mut f = AlphaBetaFilter::new(16, 512);
+        for i in 0..100i64 {
+            f.observe(i * 100_000, 5_000); // y = 5 ms constant
+        }
+        let p = f.predict(100 * 100_000).unwrap();
+        assert!((p - 5_000).abs() < 5, "p={}", p);
+        assert!(f.rate_ppb().abs() < 100, "rate_ppb={}", f.rate_ppb());
+    }
+
+    #[test]
+    fn ab_recovers_linear_drift() {
+        // y = 5_000 + 10 ppm * x (x in µs)
+        let mut f = AlphaBetaFilter::new(16, 256);
+        for i in 0..2000i64 {
+            let x = i * 100_000;
+            let y = 5_000 + (10 * x) / 1_000_000;
+            f.observe(x, y);
+        }
+        let predicted = f.predict(2001 * 100_000).unwrap();
+        let expected = 5_000 + (10 * 2001 * 100_000) / 1_000_000;
+        assert!(
+            (predicted - expected).abs() < 50,
+            "predicted={} expected={}",
+            predicted,
+            expected
+        );
+        // rate_ppb should be near 10_000 (10 ppm)
+        let r = f.rate_ppb();
+        assert!((r - 10_000).abs() < 1_000, "rate_ppb={}", r);
+    }
+
+    #[test]
+    fn ab_filters_per_sample_noise() {
+        // y = 0 + 200 µs noise
+        let mut f = AlphaBetaFilter::new(32, 1024);
+        let noise: [i64; 16] = [
+            120, -180, 90, -200, 30, 150, -80, 110, -50, 200, -100, 60, -150, 90, -30, 80,
+        ];
+        for i in 0..1000i64 {
+            f.observe(i * 100_000, noise[(i as usize) & 15]);
+        }
+        let p = f.predict(1000 * 100_000).unwrap();
+        assert!(p.abs() < 30, "p={}", p);
+    }
+}
+
 #[cfg(test)]
 mod tracker_tests {
     use super::*;

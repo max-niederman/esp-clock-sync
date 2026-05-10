@@ -32,7 +32,7 @@
 
 use core::cell::RefCell;
 
-use clock_sync::{Estimator, Quality, Sample, SyncPacket};
+use clock_sync::{AlphaBetaFilter, Estimator, Quality, Sample, SyncPacket};
 use critical_section::Mutex;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -146,9 +146,17 @@ static SAMPLES_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// `mac_tsf_us()` and `synced_ns_at_tsf` directly.
 static INSTANT_MINUS_TSF: AtomicI64 = AtomicI64::new(DELTA_UNSET);
 
-/// EMA of (ap_tsf_us - instant_us_at_cb) over beacons from our locked AP.
-/// Used by `instant_to_ap_tsf` for the precision-sync conversion.
-static AP_TSF_MINUS_INSTANT_EMA: AtomicI64 = AtomicI64::new(DELTA_UNSET);
+/// α-β filter on (instant_us_at_cb, ap_tsf_us - instant_us_at_cb). Tracks
+/// both current offset and rate-of-change (Instant↔AP_TSF crystal drift).
+/// Over a long run the rate stabilises, so per-query predictions are
+/// limited only by α-smoothed offset noise (`σ_y / sqrt(α)`) plus the
+/// rate-extrapolation error since the last update — both small.
+///
+/// α=16 → offset filter time constant ~1.6 s.
+/// β=2048 → rate filter time constant ~3.4 min; converges over a few
+/// minutes to a stable per-board rate.
+static AP_TSF_MINUS_INSTANT_FILTER: Mutex<RefCell<AlphaBetaFilter>> =
+    Mutex::new(RefCell::new(AlphaBetaFilter::new(16, 2048)));
 
 /// Public handle returned by [`install`]. Cheap to copy (`&'static`).
 pub struct ClockSyncClient {
@@ -359,23 +367,13 @@ fn rx_cb(packet: PromiscuousPkt<'_>) {
                 *LATEST_BEACON.borrow_ref_mut(cs) = Some(anchor);
             });
 
-            // EMA-smooth the (ap_tsf - instant_at_cb) offset. 1/16 EMA
-            // gives ~1.6 s time constant at 10 Hz beacons, balancing
-            // per-beacon noise filtering against drift tracking lag.
-            let new_delta = (ap_tsf_us as i64).wrapping_sub(instant_us_at_cb as i64);
-            let prev = AP_TSF_MINUS_INSTANT_EMA.load(Ordering::Relaxed);
-            let updated = if prev == DELTA_UNSET {
-                new_delta
-            } else {
-                let diff = new_delta - prev;
-                if diff.unsigned_abs() < 2_000 {
-                    prev + diff / 16
-                } else {
-                    // Outlier guard.
-                    prev + diff / 256
-                }
-            };
-            AP_TSF_MINUS_INSTANT_EMA.store(updated, Ordering::Relaxed);
+            // Feed the α-β filter for instant→AP_TSF prediction.
+            let observed_offset = (ap_tsf_us as i64).wrapping_sub(instant_us_at_cb as i64);
+            critical_section::with(|cs| {
+                AP_TSF_MINUS_INSTANT_FILTER
+                    .borrow_ref_mut(cs)
+                    .observe(instant_us_at_cb as i64, observed_offset);
+            });
             if beacons < 5 {
                 log::info!(
                     "beacon bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ap_tsf_us={ap_tsf_us} own_tsf_us={own_tsf_us} instant_us={instant_us_at_cb}",
@@ -413,20 +411,29 @@ fn own_tsf_to_ap_tsf(own_tsf_us: u64) -> Option<u64> {
     if ap < 0 { None } else { Some(ap as u64) }
 }
 
-/// Instant µs → AP_TSF µs via EMA-smoothed offset.
+/// Instant µs → AP_TSF µs via the α-β filter.
 fn instant_to_ap_tsf(instant_us: u64) -> Option<u64> {
-    let delta = AP_TSF_MINUS_INSTANT_EMA.load(Ordering::Relaxed);
-    if delta == DELTA_UNSET { return None; }
-    let ap = (instant_us as i128) + (delta as i128);
+    let offset = critical_section::with(|cs| {
+        AP_TSF_MINUS_INSTANT_FILTER
+            .borrow_ref(cs)
+            .predict(instant_us as i64)
+    })?;
+    let ap = (instant_us as i128) + (offset as i128);
     if ap < 0 || ap > u64::MAX as i128 { None } else { Some(ap as u64) }
 }
 
-/// Inverse.
+/// Inverse: find `instant` such that `instant + offset(instant) = ap_tsf`.
+/// Two-step fixed-point iteration converges quickly because the offset
+/// derivative wrt instant is the (tiny) rate, ≈ 0.
 fn ap_tsf_to_instant(ap_tsf_us: u64) -> Option<u64> {
-    let delta = AP_TSF_MINUS_INSTANT_EMA.load(Ordering::Relaxed);
-    if delta == DELTA_UNSET { return None; }
-    let inst = (ap_tsf_us as i128) - (delta as i128);
-    if inst < 0 || inst > u64::MAX as i128 { None } else { Some(inst as u64) }
+    critical_section::with(|cs| {
+        let f = AP_TSF_MINUS_INSTANT_FILTER.borrow_ref(cs);
+        let off1 = f.predict(ap_tsf_us as i64)?;
+        let inst1 = (ap_tsf_us as i64).wrapping_sub(off1);
+        let off2 = f.predict(inst1)?;
+        let inst2 = (ap_tsf_us as i64).wrapping_sub(off2);
+        if inst2 < 0 { None } else { Some(inst2 as u64) }
+    })
 }
 
 fn instant_us_to_tsf_us(instant_us: u64) -> Option<u64> {
