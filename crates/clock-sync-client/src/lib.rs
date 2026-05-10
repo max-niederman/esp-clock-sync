@@ -155,6 +155,10 @@ static INSTANT_MINUS_TSF: AtomicI64 = AtomicI64::new(DELTA_UNSET);
 /// α=16 → offset filter time constant ~1.6 s.
 /// β=2048 → rate filter time constant ~3.4 min; converges over a few
 /// minutes to a stable per-board rate.
+///
+/// Empirically these gains beat (α=32, β=4096) — smaller α tracks short-
+/// term offset variations better; smaller β still gives enough rate
+/// stability for the per-board crystal drift signal.
 static AP_TSF_MINUS_INSTANT_FILTER: Mutex<RefCell<AlphaBetaFilter>> =
     Mutex::new(RefCell::new(AlphaBetaFilter::new(16, 2048)));
 
