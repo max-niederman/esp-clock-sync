@@ -1,0 +1,48 @@
+[package]
+name = "clock-sync-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "ESP32 pulse-rig firmware for measuring inter-client clock-sync precision."
+
+[dependencies]
+clock-sync = { workspace = true, default-features = false }
+clock-sync-client = { workspace = true }
+
+embassy-executor = { workspace = true }
+embassy-time = { workspace = true }
+embassy-sync = { workspace = true }
+embassy-net = { workspace = true, features = ["dhcpv4", "medium-ethernet", "udp", "proto-ipv4"] }
+
+esp-hal = { workspace = true }
+esp-rtos = { workspace = true }
+esp-radio = { workspace = true }
+esp-backtrace = { workspace = true }
+esp-bootloader-esp-idf = { workspace = true }
+esp-println = { workspace = true }
+esp-alloc = { workspace = true }
+
+static_cell = { workspace = true }
+log = { workspace = true }
+embedded-io-async = "0.6"
+critical-section = { workspace = true }
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+[features]
+default = ["esp32"]
+esp32 = [
+  "clock-sync-client/esp32",
+  "esp-hal/esp32",
+  "esp-rtos/esp32",
+  "esp-radio/esp32",
+  "esp-backtrace/esp32",
+  "esp-bootloader-esp-idf/esp32",
+]
+
+[[bin]]
+name = "clock-sync-test"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false

@@ -26,6 +26,22 @@
         {package = pkgs.clippy;}
         {package = pkgs.espflash;}
         {package = pkgs.picocom;}
+        {
+          name = "host-cargo";
+          help = "cargo invocation that uses the regular nixpkgs rustc (host-target builds only)";
+          command = ''
+            exec env \
+              -u RUSTC \
+              -u RUSTFLAGS \
+              -u CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS \
+              -u CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER \
+              PATH="${pkgs.rustc}/bin:$PATH" \
+              RUSTFLAGS="" \
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="" \
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc \
+              ${pkgs.cargo}/bin/cargo "$@"
+          '';
+        }
       ];
 
       env = [
@@ -65,15 +81,16 @@
           The other tools (Cargo, espflash, etc.) are source-based and come from regular Nixpkgs.
           $(menu)
 
-          You can now run:
-            • {bold}cd embassy_hello_world{reset}
-            • {bold}cargo build --features esp32 --target xtensa-esp32-none-elf --release{reset}
-            • {bold}cargo doc   --features esp32 --target xtensa-esp32-none-elf --release --open{reset}
-            • {bold}espflash save-image --chip esp32 target/xtensa-esp32-none-elf/release/embassy-hello-world out.bin{reset}
+          ESP32 firmware (sandboxed esp-fork rustc):
+            • {bold}cd crates/clock-sync-firmware && cargo build --release --features esp32{reset}
+            • {bold}cd crates/clock-sync-test     && cargo build --release --features esp32{reset}
+            • {bold}cd crates/clock-sync-firmware && cargo run   --release --features esp32{reset}  (flash + monitor)
 
-          To flash, and monitor output:
-            • {bold}cargo espflash flash --monitor --features esp32 --target xtensa-esp32-none-elf --release{reset}
-            • {bold}cargo run --release{reset} (alias of ^)
+          Host (Linux) binaries (regular nixpkgs rustc — uses {bold}host-cargo{reset}):
+            • {bold}cd crates/clock-sync-server && host-cargo build --release{reset}
+            • {bold}cd crates/skew-meter        && host-cargo build --release{reset}
+
+          Serial monitor (alternative):
             • {bold}picocom --baud=115200 --imap lfcrlf /dev/ttyUSB0{reset}
         '';
 

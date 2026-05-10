@@ -1,0 +1,16 @@
+[package]
+name = "clock-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Wire format and offset/drift estimator shared by clock-sync-{client,server,test}."
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+test = true
+doctest = false
+bench = false

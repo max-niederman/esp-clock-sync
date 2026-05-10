@@ -1,0 +1,9 @@
+# Override any host-system ~/.cargo/config.toml settings that would otherwise
+# reach into a now-missing /nix/store path. We pin the host linker to `cc`
+# (resolved via PATH) and reset rustflags. cargo's rustflags merging is
+# nuanced — for belt-and-braces the host-cargo wrapper also clears
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS / RUSTFLAGS at runtime.
+
+[target.x86_64-unknown-linux-gnu]
+linker = "cc"
+rustflags = []

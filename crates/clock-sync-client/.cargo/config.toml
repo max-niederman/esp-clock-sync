@@ -5,15 +5,8 @@ rustflags = ["-C", "link-arg=-Tlinkall.x", "-C", "force-frame-pointers"]
 [target.'cfg(target_arch = "xtensa")']
 runner = "espflash flash --monitor"
 rustflags = [
-  # GNU LD
-  "-C",
-  "link-arg=-Wl,-Tlinkall.x",
-  "-C",
-  "link-arg=-nostartfiles",
-
-  # LLD
-  # "-C", "link-arg=-Tlinkall.x",
-  # "-C", "linker=rust-lld",
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+  "-C", "link-arg=-nostartfiles",
 ]
 
 [env]
@@ -23,6 +16,4 @@ ESP_LOG = "info"
 build-std = ["core", "alloc"]
 
 [build]
-# Sets the default target for less noisy `cargo build`, `rust-analyzer` etc.
-# Remove if you change chips often:
 target = "xtensa-esp32-none-elf"

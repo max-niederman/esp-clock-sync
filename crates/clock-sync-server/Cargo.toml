@@ -1,0 +1,24 @@
+[package]
+name = "clock-sync-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Linux time-server: broadcasts SyncPackets at fixed cadence."
+
+[dependencies]
+clock-sync = { workspace = true, default-features = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "clock-sync-server"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false

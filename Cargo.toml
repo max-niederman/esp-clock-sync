@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/clock-sync",
+  "crates/clock-sync-client",
+  "crates/clock-sync-firmware",
+  "crates/clock-sync-test",
+  "crates/clock-sync-server",
+  "crates/skew-meter",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Shared (no_std capable) lib
+clock-sync = { path = "crates/clock-sync", default-features = false }
+clock-sync-client = { path = "crates/clock-sync-client" }
+
+# Embedded
+embassy-executor = "0.9.0"
+embassy-time = "0.5.0"
+embassy-sync = "0.7.2"
+embassy-futures = "0.1"
+embassy-net = { version = "0.7", default-features = false }
+esp-hal = { version = "1.0.0", features = ["log-04", "unstable"] }
+esp-rtos = { version = "0.2.0", features = ["embassy", "esp-radio", "log-04"] }
+esp-radio = { version = "0.17.0", default-features = false, features = ["log-04", "wifi", "sniffer", "unstable"] }
+esp-backtrace = { version = "0.18.0", features = ["panic-handler", "println"] }
+esp-bootloader-esp-idf = "0.4.0"
+esp-println = { version = "0.16.0", features = ["log-04"] }
+esp-alloc = "0.9.0"
+critical-section = "1"
+static_cell = "2"
+log = "0.4"
+
+# Host
+clap = { version = "4", features = ["derive"] }
+serialport = { version = "4", default-features = false }
+crossbeam-channel = "0.5"
+anyhow = "1"
+nix = { version = "0.29", default-features = false, features = ["net"] }
+
+[profile.release]
+debug = true
+debug-assertions = true
+lto = "fat"
+codegen-units = 1
