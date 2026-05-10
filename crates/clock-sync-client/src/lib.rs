@@ -371,7 +371,13 @@ fn rx_cb(packet: PromiscuousPkt<'_>) {
                 *LATEST_BEACON.borrow_ref_mut(cs) = Some(anchor);
             });
 
-            // Feed the α-β filter for instant→AP_TSF prediction.
+            // Feed the α-β filter for instant→AP_TSF prediction. Tested but
+            // not used: subtracting per-sample (mac_tsf_us - rx_cntl.timestamp)
+            // from instant_at_cb to "back-step to physical RX time" drops
+            // cross-board p50 from 29 µs to 1.6 ms — empirically `mac_tsf_us`
+            // and `rx_cntl.timestamp` are not in compatible timebases on
+            // ESP32 (the former tracks AP TSF, the latter is the local MAC
+            // free-running clock). Using `instant_at_cb` directly works.
             let observed_offset = (ap_tsf_us as i64).wrapping_sub(instant_us_at_cb as i64);
             critical_section::with(|cs| {
                 AP_TSF_MINUS_INSTANT_FILTER
