@@ -32,7 +32,7 @@
 
 use core::cell::RefCell;
 
-use clock_sync::{AlphaBetaFilter, Estimator, Quality, Sample, SyncPacket};
+use clock_sync::{AlphaBetaFilter, Estimator, LinearTracker, Quality, Sample, SyncPacket};
 use critical_section::Mutex;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -107,10 +107,47 @@ static LATEST_BEACON: Mutex<RefCell<Option<BeaconAnchor>>> =
     Mutex::new(RefCell::new(None));
 
 #[derive(Clone, Copy, Debug)]
-struct BeaconAnchor {
-    instant_us: u64,
-    own_tsf_us: u64,
-    ap_tsf_us: u64,
+pub struct BeaconAnchor {
+    pub instant_us: u64,
+    pub own_tsf_us: u64,
+    pub ap_tsf_us: u64,
+    /// Application-supplied "extra" timestamp captured by `BEACON_HOOK` at
+    /// the same callback line as `instant_us`. Used by clients that have
+    /// their own hardware timer (e.g. MCPWM CAP) and want to convert
+    /// future capture-timer values to `ap_tsf_us` via this anchor.
+    pub extra_us: u64,
+}
+
+/// Hook called inside the beacon RX callback. Lets the application sample
+/// a custom timer (e.g. MCPWM CAP via SW capture) at the same moment as
+/// the beacon anchor is recorded. Set via [`set_beacon_hook`]; defaults
+/// to a no-op returning 0.
+type BeaconHook = fn() -> u64;
+static BEACON_HOOK: portable_atomic::AtomicPtr<()> =
+    portable_atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Register a callback to be invoked inside the beacon RX path, returning
+/// an application-defined "extra" timestamp that gets stored in the
+/// beacon anchor. Pass a function pointer (must be `fn() -> u64`).
+///
+/// Use this to take a SW capture of an external timer (e.g. the MCPWM
+/// CAP timer) at exactly the same moment as the beacon anchor — you can
+/// then convert future capture values to `ap_tsf_us` via
+/// [`extra_to_ap_tsf`] without going through the noisy `Instant↔TSF`
+/// EMA filter.
+pub fn set_beacon_hook(hook: BeaconHook) {
+    BEACON_HOOK.store(hook as *mut (), Ordering::Relaxed);
+}
+
+#[inline]
+fn invoke_beacon_hook() -> u64 {
+    let p = BEACON_HOOK.load(Ordering::Relaxed);
+    if p.is_null() {
+        0
+    } else {
+        let f: BeaconHook = unsafe { core::mem::transmute(p) };
+        f()
+    }
 }
 
 /// UDP estimator: AP_TSF → server_ns (wall time). Noisy due to AP buffering;
@@ -161,6 +198,19 @@ static INSTANT_MINUS_TSF: AtomicI64 = AtomicI64::new(DELTA_UNSET);
 /// stability for the per-board crystal drift signal.
 static AP_TSF_MINUS_INSTANT_FILTER: Mutex<RefCell<AlphaBetaFilter>> =
     Mutex::new(RefCell::new(AlphaBetaFilter::new(16, 2048)));
+
+/// α-β filter for the application's "extra" timer (typically MCPWM CAP):
+/// tracks `(extra_us_at_cb, ap_tsf_us - extra_us_at_cb / extra_per_us)`.
+/// α=512 + 500 µs innovation clamp is the empirical sweet spot:
+/// α=256 (p99 ~150 µs); α=512 (p99 ~302 µs raw, ~30 µs after clamp);
+/// α=768 (rate filter can't catch up after the clamp throws out
+/// transients, p99 ~15 ms); α=1024 (drift dominates).
+static AP_TSF_MINUS_EXTRA_FILTER: Mutex<RefCell<AlphaBetaFilter>> =
+    Mutex::new(RefCell::new(AlphaBetaFilter::new(512, 2048)));
+/// Q32 ticks-per-µs used to feed the EXTRA filter; populated from the
+/// first call to [`synced_ns_at_extra_filtered`] (or [`set_extra_rate`]).
+/// Sentinel `0` means "not configured".
+static EXTRA_PER_US_Q32: AtomicU64 = AtomicU64::new(0);
 
 /// Public handle returned by [`install`]. Cheap to copy (`&'static`).
 pub struct ClockSyncClient {
@@ -226,6 +276,71 @@ impl ClockSyncClient {
     pub fn synced_ns_at_own_tsf(&self, own_tsf_us: u64) -> Option<u128> {
         let ap_tsf_us = own_tsf_to_ap_tsf(own_tsf_us)?;
         critical_section::with(|cs| UDP_EST.borrow_ref(cs).synced_ns_at(ap_tsf_us))
+    }
+
+    /// Convert an "extra" timer reading (whose units must match the value
+    /// returned by the [`BeaconHook`] registered via [`set_beacon_hook`])
+    /// into a server-time nanosecond. The conversion uses the latest
+    /// beacon anchor's `(extra_us, ap_tsf_us)` pair plus a caller-supplied
+    /// `extra_us_per_us` rate (1.0 if your extra timer ticks at 1 MHz).
+    ///
+    /// Use this when you have a HARDWARE-captured event timestamp on a
+    /// timer that's NOT `mac_tsf_us` — e.g. the ESP32 MCPWM CAP timer,
+    /// which catches GPIO edges in hardware (zero ISR jitter). Both the
+    /// anchor `extra_us` and the event `extra_us` come from the same
+    /// timer, so per-board crystal mismatch only affects the (small)
+    /// elapsed time since the last beacon.
+    ///
+    /// Pass `extra_us_per_us_q32` as Q32 fixed-point: e.g. for an 80 MHz
+    /// timer where 1 µs = 80 ticks, use `80 << 32`.
+    pub fn synced_ns_at_extra(
+        &self,
+        extra_us: u64,
+        extra_per_us_q32: u64,
+    ) -> Option<u128> {
+        let a = critical_section::with(|cs| *LATEST_BEACON.borrow_ref(cs))?;
+        // delta_extra = (extra_now - extra_anchor); divide by extra_per_us
+        // (Q32) to get µs elapsed since the anchor.
+        let delta_extra = (extra_us as i128).wrapping_sub(a.extra_us as i128);
+        // delta_us = (delta_extra << 32) / extra_per_us_q32. Avoid the
+        // intermediate >> 32 to preserve precision: result of the div is
+        // already in µs.
+        if extra_per_us_q32 == 0 {
+            return None;
+        }
+        let delta_us = (delta_extra << 32) / extra_per_us_q32 as i128;
+        let ap = (a.ap_tsf_us as i128) + delta_us;
+        if ap < 0 || ap > u64::MAX as i128 {
+            return None;
+        }
+        critical_section::with(|cs| UDP_EST.borrow_ref(cs).synced_ns_at(ap as u64))
+    }
+
+    /// Snapshot the latest beacon anchor (sub-µs `(own_tsf, ap_tsf)`,
+    /// best-effort `instant_us`/`extra_us`).
+    pub fn latest_beacon(&self) -> Option<BeaconAnchor> {
+        critical_section::with(|cs| *LATEST_BEACON.borrow_ref(cs))
+    }
+
+    /// Like [`Self::synced_ns_at_extra`] but predicts via the
+    /// `AP_TSF_MINUS_EXTRA_FILTER` (α=1024, β=4096) — heavy smoothing to
+    /// pull the ~500 µs per-beacon RX-time jitter down to ~16 µs.
+    pub fn synced_ns_at_extra_filtered(
+        &self,
+        extra_us: u64,
+        extra_per_us_q32: u64,
+    ) -> Option<u128> {
+        // Persist the rate so the rx_cb knows how to feed the filter.
+        EXTRA_PER_US_Q32.store(extra_per_us_q32, Ordering::Relaxed);
+        let extra_in_us = (((extra_us as i128) << 32) / extra_per_us_q32 as i128) as i64;
+        let offset = critical_section::with(|cs| {
+            AP_TSF_MINUS_EXTRA_FILTER.borrow_ref(cs).predict(extra_in_us)
+        })?;
+        let ap = (extra_in_us as i128) + (offset as i128);
+        if ap < 0 || ap > u64::MAX as i128 {
+            return None;
+        }
+        critical_section::with(|cs| UDP_EST.borrow_ref(cs).synced_ns_at(ap as u64))
     }
 
     /// Inverse of [`Self::synced_ns_at_own_tsf`]: given a target
@@ -306,11 +421,15 @@ impl ClockSyncClient {
 /// 2. **Our magic UDP packet** (`SyncPacket::find_in_frame`). Pair
 ///    (server_ns, our MAC RX TSF) for the slow wall-clock estimator.
 fn rx_cb(packet: PromiscuousPkt<'_>) {
+    // **Order matters**: take the application's "extra" timer FIRST so it
+    // reflects the moment closest to dispatch (~few cycles into the
+    // callback) before any other work runs. Subsequent reads
+    // (`Instant::now`, `mac_tsf_us`, packet parsing) drift the apparent
+    // dispatch time forward by tens of µs each — feeding the EXTRA filter
+    // with the latest of those reads (rather than this earliest one)
+    // would be a directly-measurable fraction of the inter-board jitter.
+    let extra_us = invoke_beacon_hook();
     let tsf_raw_low = packet.rx_cntl.timestamp;
-    // Capture instant FIRST and own_tsf SECOND, both inside the callback. The
-    // tiny difference (instant_at_cb - own_tsf_at_cb) measures the callback's
-    // internal Instant↔TSF delta at *callback time*. This matters because we
-    // want to back-compute the Instant value at the *physical RX time* below.
     let instant_us_at_cb = Instant::now().as_micros();
     let own_tsf_at_cb = mac_tsf_us();
     FRAMES_SEEN.fetch_add(1, Ordering::Relaxed);
@@ -359,10 +478,20 @@ fn rx_cb(packet: PromiscuousPkt<'_>) {
 
         if pass {
             let beacons = BEACONS_USED.fetch_add(1, Ordering::Relaxed);
+            // `extra_us` was captured at the very top of rx_cb (closest
+            // to physical RX). We tried subtracting `cb_latency =
+            // own_tsf_at_cb - own_tsf_us` to back-step further but on
+            // ESP32 `mac_tsf_us()` tracks AP TSF (synced) while
+            // `rx_cntl.timestamp` tracks the local MAC free-running
+            // clock — they're in different timebases, so the correction
+            // explodes inter-board diffs to ~6 ms. We rely on the OLS
+            // tracker to smooth per-beacon dispatch noise instead.
+            let extra_q32 = EXTRA_PER_US_Q32.load(Ordering::Relaxed);
             let anchor = BeaconAnchor {
                 instant_us: instant_us_at_cb,
                 own_tsf_us,
                 ap_tsf_us,
+                extra_us,
             };
             // Update the precision anchor immediately (before async hop), so
             // that conversions performed shortly after this beacon use the
@@ -371,19 +500,24 @@ fn rx_cb(packet: PromiscuousPkt<'_>) {
                 *LATEST_BEACON.borrow_ref_mut(cs) = Some(anchor);
             });
 
-            // Feed the α-β filter for instant→AP_TSF prediction. Tested but
-            // not used: subtracting per-sample (mac_tsf_us - rx_cntl.timestamp)
-            // from instant_at_cb to "back-step to physical RX time" drops
-            // cross-board p50 from 29 µs to 1.6 ms — empirically `mac_tsf_us`
-            // and `rx_cntl.timestamp` are not in compatible timebases on
-            // ESP32 (the former tracks AP TSF, the latter is the local MAC
-            // free-running clock). Using `instant_at_cb` directly works.
             let observed_offset = (ap_tsf_us as i64).wrapping_sub(instant_us_at_cb as i64);
             critical_section::with(|cs| {
                 AP_TSF_MINUS_INSTANT_FILTER
                     .borrow_ref_mut(cs)
                     .observe(instant_us_at_cb as i64, observed_offset);
             });
+
+            // Feed the EXTRA α-β filter. Convert extra→µs so offset/rate
+            // stay in compatible units.
+            if extra_q32 != 0 {
+                let extra_in_us = (((extra_us as i128) << 32) / extra_q32 as i128) as i64;
+                let observed_offset = (ap_tsf_us as i64).wrapping_sub(extra_in_us);
+                critical_section::with(|cs| {
+                    AP_TSF_MINUS_EXTRA_FILTER
+                        .borrow_ref_mut(cs)
+                        .observe(extra_in_us, observed_offset);
+                });
+            }
             if beacons < 5 {
                 log::info!(
                     "beacon bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ap_tsf_us={ap_tsf_us} own_tsf_us={own_tsf_us} instant_us={instant_us_at_cb}",

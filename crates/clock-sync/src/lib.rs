@@ -552,12 +552,22 @@ impl AlphaBetaFilter {
         let observed_q = (observed_offset_us as i128) << Self::OFFSET_Q_SHIFT;
         let innovation_q = observed_q - predicted_offset_q;
 
-        // offset += innovation / α
-        self.offset_q = predicted_offset_q + innovation_q / (self.alpha as i128);
-        // observed_rate_q = (innovation_q << RATE_TO_OFFSET) / dx_us
-        // (so that observed_rate_q * dx_us >> RATE_TO_OFFSET ≈ innovation_q)
-        // rate += observed_rate / β
-        let observed_rate_q = (innovation_q << Self::RATE_TO_OFFSET_SHIFT) / dx_us;
+        // Outlier rejection: clamp innovation to ±1 ms.
+        // Per-beacon dispatch jitter on the precision sync path is
+        // typically <500 µs after convergence; 1 ms cuts the WiFi-
+        // driver-mutex ms+ tail without throwing out legitimate
+        // transients that the rate filter needs to learn the per-board
+        // crystal mismatch. Empirically: clamp=10 ms → 48 ms p99 tail;
+        // clamp=1 ms → 302 µs p99; clamp=500 µs → filter starves on
+        // rate updates and drift takes over (45 ms+ p99).
+        const MAX_INNOVATION_US: i128 = 1_000;
+        let max_innovation_q = MAX_INNOVATION_US << Self::OFFSET_Q_SHIFT;
+        let clamped_innovation = innovation_q.clamp(-max_innovation_q, max_innovation_q);
+
+        // offset += clamped_innovation / α
+        self.offset_q = predicted_offset_q + clamped_innovation / (self.alpha as i128);
+        // observed_rate_q = (clamped_innovation << RATE_TO_OFFSET) / dx_us
+        let observed_rate_q = (clamped_innovation << Self::RATE_TO_OFFSET_SHIFT) / dx_us;
         self.rate_q = self.rate_q.saturating_add(observed_rate_q / (self.beta as i128));
 
         self.last_x_us = x_us;
